@@ -35,7 +35,6 @@ BIN_PATH="${INSTALL_DIR}/mpd2hls"
 ENV_FILE="${INSTALL_DIR}/mpd2hls.env"
 MANAGER_SCRIPT_PATH="${INSTALL_DIR}/install.sh"
 INSTALLER_API_VERSION="3"
-INSTALLER_RELEASE_VERSION="0.0.35"
 SERVICE_NAME="mpd2hls"
 LEGACY_SERVICE_NAME="mpd2hls-panel"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
@@ -232,7 +231,9 @@ download_binary_asset() {
   log "  - 二进制角色校验: panel ✅"
   binary_version="$("$tmp" --version 2>/dev/null || true)"
   actual_version="${binary_version##* }"
-  expected_version="$INSTALLER_RELEASE_VERSION"
+  # The release tag is the only version source. Resolve it before downloading,
+  # then reject any binary whose embedded version does not match that release.
+  expected_version="$(release_version "$tag")"
   if [ "$actual_version" != "$expected_version" ]; then
     rm -f "$tmp"
     error "二进制版本不匹配：期望 ${expected_version}，实际 ${actual_version:-unknown}；现有服务未改动"
@@ -260,11 +261,9 @@ download_binary() {
 }
 
 validate_manager_script() {
-  local path="$1" expected_version="$2" actual_version
+  local path="$1"
   bash -n "$path" && \
     grep -q '^INSTALLER_API_VERSION="3"$' "$path" || return 1
-  actual_version="$(awk -F'"' '/^INSTALLER_RELEASE_VERSION="[0-9]+\.[0-9]+\.[0-9]+"$/ { print $2; exit }' "$path")"
-  [[ "$actual_version" == "$expected_version" ]]
 }
 
 download_manager_script() {
@@ -275,7 +274,7 @@ download_manager_script() {
   rm -f "$tmp"
   step "下载并校验最新管理脚本 ..."
   log "  - URL: $url"
-  if ! curl -fL --progress-bar -o "$tmp" "$url" || ! validate_manager_script "$tmp" "$(release_version "$tag")"; then
+  if ! curl -fL --progress-bar -o "$tmp" "$url" || ! validate_manager_script "$tmp"; then
     rm -f "$tmp"
     error "管理脚本下载或兼容性校验失败，现有服务和二进制未改动"
   fi
