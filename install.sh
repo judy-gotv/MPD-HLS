@@ -335,6 +335,8 @@ PANEL_ADMIN_PATH=${PANEL_ADMIN_PATH}
 PANEL_PROCESS_NAME=mpd2hls
 # 面板持久化数据库。默认 SQLite；改为 postgres://... 可切换 PostgreSQL。
 PANEL_DATABASE_URL=sqlite://./panel.db
+# 旧 JSON 迁移备份目录；留空时 SQLite 使用数据库目录，PostgreSQL 使用旧 JSON 所在目录。
+PANEL_MIGRATION_BACKUP_DIR=
 # 以下 JSON 路径仅用于首次升级时的一次性迁移，迁移完成后不再读取。
 PANEL_CHANNELS_FILE=./channels.json
 # 仅作为旧版本认证数据的一次性迁移源；运行时认证保存在 panel.db。
