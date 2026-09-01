@@ -44,6 +44,9 @@ LEGACY_SERVICE_FILE="${SYSTEMD_DIR}/${LEGACY_SERVICE_NAME}.service"
 PANEL_PORT="${PANEL_PORT:-9527}"
 PANEL_ADMIN_PATH="${PANEL_ADMIN_PATH:-/admin}"
 GH_REPO="${GH_REPO:-judy-gotv/MPD-HLS}"
+PANEL_LOGIN_USER=""
+PANEL_LOGIN_PASSWORD=""
+PANEL_LOGIN_NOTE=""
 
 # GitHub Releases - latest 自动指向最新版本
 GH_RELEASE_TAG="${GH_RELEASE_TAG:-latest}"
@@ -330,13 +333,17 @@ PANEL_ALLOW_INSECURE_PUBLIC_BIND=0
 PANEL_ENABLE_WORKER_ADMIN=1
 PANEL_ADMIN_PATH=${PANEL_ADMIN_PATH}
 PANEL_PROCESS_NAME=mpd2hls
+# 面板持久化数据库。默认 SQLite；改为 postgres://... 可切换 PostgreSQL。
+PANEL_DATABASE_URL=sqlite://./panel.db
+# 以下 JSON 路径仅用于首次升级时的一次性迁移，迁移完成后不再读取。
 PANEL_CHANNELS_FILE=./channels.json
+# 仅作为旧版本认证数据的一次性迁移源；运行时认证保存在 panel.db。
 PANEL_AUTH_FILE=./panel_auth.json
 PANEL_AUDIT_LOG_FILE=./audit.log
 # Panel/worker API token 文件；留空环境 token 时会自动生成并使用该文件
 PANEL_API_TOKEN_FILE=./panel_api_token
 
-# ---------- 默认账号 (仅首次生成 panel_auth.json 时生效) ----------
+# ---------- 默认账号 (仅首次迁移/初始化数据库时生效) ----------
 PANEL_ADMIN_USER=admin
 # 留空时首次启动会随机生成临时密码并打印到 stderr/journal，登录后可在面板自行修改。
 PANEL_ADMIN_PASS=
@@ -631,10 +638,53 @@ rollback_binary_update() {
   return 1
 }
 
+ensure_panel_database_login() {
+  local database_url admin_user admin_pass legacy_auth
+  database_url="$(read_env_value PANEL_DATABASE_URL || true)"
+  database_url="${database_url:-sqlite://./panel.db}"
+  admin_user="$(read_env_value PANEL_ADMIN_USER || true)"
+  admin_user="${admin_user:-admin}"
+  admin_pass="$(read_env_value PANEL_ADMIN_PASS || true)"
+  PANEL_LOGIN_USER="${admin_user}"
+
+  if (cd "$INSTALL_DIR" && PANEL_DATABASE_URL="$database_url" "$BIN_PATH" --auth-configured 2>/dev/null | grep -qx yes); then
+    PANEL_LOGIN_PASSWORD="沿用已有数据库认证（脚本无法反向读取旧密码）"
+    PANEL_LOGIN_NOTE="认证、频道和面板状态已保存在 panel.db；运行时不再读取旧 JSON。"
+    log "检测到已有数据库认证，保留现有登录密码。"
+    return
+  fi
+
+  legacy_auth="$(cd "$INSTALL_DIR" && PANEL_DATABASE_URL="$database_url" "$BIN_PATH" --legacy-auth-present 2>/dev/null || true)"
+  if [ "$legacy_auth" = "yes" ]; then
+    (cd "$INSTALL_DIR" && PANEL_DATABASE_URL="$database_url" "$BIN_PATH" --migrate-legacy-json)
+    PANEL_LOGIN_PASSWORD="沿用旧认证（密码已迁移到 panel.db，脚本无法反向读取）"
+    PANEL_LOGIN_NOTE="旧 JSON 已完成一次性迁移并保留迁移备份；后续运行时不再读取旧 JSON。"
+    log "旧认证和面板数据已迁移到 panel.db。"
+    return
+  fi
+
+  if [ -z "$admin_pass" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+      admin_pass="$(openssl rand -hex 18)"
+    else
+      admin_pass="$(od -An -N18 -tx1 /dev/urandom | tr -d ' \n')"
+    fi
+  fi
+  (cd "$INSTALL_DIR" && PANEL_DATABASE_URL="$database_url" PANEL_ADMIN_USER="$admin_user" PANEL_ADMIN_PASS="$admin_pass" "$BIN_PATH" --migrate-legacy-json)
+  if ! (cd "$INSTALL_DIR" && PANEL_DATABASE_URL="$database_url" "$BIN_PATH" --auth-configured 2>/dev/null | grep -qx yes); then
+    error "数据库认证状态初始化失败，服务未启动"
+  fi
+  PANEL_LOGIN_PASSWORD="$admin_pass"
+  PANEL_LOGIN_NOTE="认证已初始化到 panel.db；请登录后在面板中修改密码。"
+}
+
 # ---------------- 提取首次启动密码 ----------------
 show_admin_password() {
-  if [ -f "${INSTALL_DIR}/panel_auth.json" ]; then
-    # 已存在 auth 文件，密码已被哈希持久化
+  [ -n "${PANEL_LOGIN_PASSWORD:-}" ] && return
+  local database_url
+  database_url="$(read_env_value PANEL_DATABASE_URL || true)"
+  database_url="${database_url:-sqlite://./panel.db}"
+  if [ -x "$BIN_PATH" ] && (cd "$INSTALL_DIR" && PANEL_DATABASE_URL="$database_url" "$BIN_PATH" --auth-configured 2>/dev/null | grep -qx yes); then
     return
   fi
   # 等待日志输出
@@ -685,17 +735,22 @@ print_banner() {
   echo -e "    二进制   : ${BIN_PATH}"
   echo -e "    配置     : ${ENV_FILE}   ${YELLOW}(修改后 systemctl restart ${SERVICE_NAME})${NC}"
   echo -e "    频道     : ${INSTALL_DIR}/channels.json"
-  echo -e "    认证     : ${INSTALL_DIR}/panel_auth.json"
+  echo -e "    数据库   : ${INSTALL_DIR}/panel.db（认证、频道和面板状态）"
   echo -e "    日志     : journalctl -u ${SERVICE_NAME} -f"
   echo -e "${GREEN}--------------------------------------------${NC}"
   echo -e "  🔐  ${YELLOW}${BOLD}默认账号${NC}"
-  echo -e "      用户名 : ${CYAN}${BOLD}admin${NC}"
-  echo -e "      密  码 : ${YELLOW}首次启动随机生成，请查看下方日志：${NC}"
-  echo
-  show_admin_password
-  echo
-  echo -e "      ${BOLD}手动查看密码命令：${NC}"
-  echo -e "        ${CYAN}journalctl -u ${SERVICE_NAME} | grep -i 'temporary password'${NC}"
+  echo -e "      用户名 : ${CYAN}${BOLD}${PANEL_LOGIN_USER:-admin}${NC}"
+  if [ -n "${PANEL_LOGIN_PASSWORD:-}" ]; then
+    echo -e "      密  码 : ${YELLOW}${PANEL_LOGIN_PASSWORD}${NC}"
+  else
+    echo -e "      密  码 : ${YELLOW}首次启动随机生成，请查看下方日志：${NC}"
+    echo
+    show_admin_password
+    echo
+    echo -e "      ${BOLD}手动查看密码命令：${NC}"
+    echo -e "        ${CYAN}journalctl -u ${SERVICE_NAME} | grep -i 'temporary password'${NC}"
+  fi
+  [ -z "${PANEL_LOGIN_NOTE:-}" ] || echo -e "      提  示 : ${PANEL_LOGIN_NOTE}"
   echo -e "  ⚠️   ${YELLOW}登录后请立即在面板「账号设置」中修改密码！${NC}"
   echo -e "${GREEN}--------------------------------------------${NC}"
   echo -e "  ${BOLD}常用命令${NC}"
@@ -728,6 +783,7 @@ do_install() {
   GH_RELEASE_TAG="$tag"
   download_binary "$arch" "$tag"
   init_env_file
+  ensure_panel_database_login
   write_systemd_service
   start_service || error "服务启动失败，请查看 journalctl -u ${SERVICE_NAME} -n 80 --no-pager"
   print_banner "$arch"
@@ -757,6 +813,7 @@ do_update_internal() {
   fi
   rm -f "$staged_binary"
   log "  - 已安装到 $BIN_PATH ✅"
+  ensure_panel_database_login
   if ! write_systemd_service || ! start_service || ! verify_update_topology; then
     rollback_binary_update "$rollback_path"
     return 1
@@ -853,20 +910,21 @@ do_logs() {
 
 do_show_password() {
   step "查找首次启动随机密码 ..."
-  local line
+  local line database_url
+  database_url="$(read_env_value PANEL_DATABASE_URL || true)"
+  database_url="${database_url:-sqlite://./panel.db}"
   line=$($SUDO journalctl -u "$SERVICE_NAME" --no-pager 2>/dev/null | grep -i "generated one-time temporary password" | tail -1 || true)
   if [ -n "$line" ]; then
     echo -e "${YELLOW}${BOLD}$line${NC}"
   else
     warn "未在日志中找到随机密码记录。可能原因："
     echo "  1) 你已经在 $ENV_FILE 里设置了 PANEL_ADMIN_PASS=xxx"
-    echo "  2) panel_auth.json 已存在（密码已被持久化哈希存储）"
+    echo "  2) 数据库中已存在认证状态（密码以哈希形式保存）"
     echo "  3) 日志已轮转，可尝试: journalctl -u $SERVICE_NAME --since '2 hours ago'"
     echo ""
-    echo "如需重置密码："
+    echo "如需重置密码（不会删除旧 JSON）："
     echo "  systemctl stop $SERVICE_NAME"
-    echo "  rm -f $INSTALL_DIR/panel_auth.json"
-    echo "  # 编辑 $ENV_FILE 把 PANEL_ADMIN_PASS 留空（或设为你想要的密码）"
+    echo "  cd $INSTALL_DIR && PANEL_DATABASE_URL=$database_url $BIN_PATH --set-login admin:新密码"
     echo "  systemctl start $SERVICE_NAME"
     echo "  bash $0 password   # 再次查看"
   fi
